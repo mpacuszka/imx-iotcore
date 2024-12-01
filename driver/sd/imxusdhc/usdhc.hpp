@@ -22,6 +22,12 @@
 #pragma warning(disable:4201) // nameless struct/union
 
 //
+// Std tuning related defines
+//
+#define USDHC_TUNING_RETRIES                40
+#define USDHC_TUNING_CMD_TIMEOUT_MS         150
+
+//
 // Number of register maximum polls
 //
 #define USDHC_POLL_RETRY_COUNT              100000
@@ -137,11 +143,24 @@ typedef struct {
     VOID* PhysicalAddress;
     SDPORT_CAPABILITIES Capabilities;
     UINT32 CurrentTransferRemainingLength;
-    RECORDER_LOG IfrLogHandle; 
+    RECORDER_LOG IfrLogHandle;
     BOOLEAN CrashdumpMode;
     BOOLEAN BreakOnDdiEnter;
     BOOLEAN BreakOnDdiExit;
     BOOLEAN BreakOnError;
+
+    volatile BOOLEAN WaitTuningCmd;
+    volatile NTSTATUS TuningStatus;
+    volatile BOOLEAN TuningInProgress;
+
+    PSDPORT_REQUEST OutstandingRequest;
+    ULONG CurrentEvents;
+    ULONG CurrentErrors;
+
+    KDPC LocalRequestDpc;
+    LONG LocalRequestPending;
+
+    PIO_WORKITEM CompleteRequestBusyWorkItem;
 
     //
     // Information populated from ACPI
@@ -273,6 +292,15 @@ NTSTATUS
 SdhcStartAdmaTransfer(
     _In_ USDHC_EXTENSION* SdhcExtPtr,
     _In_ SDPORT_REQUEST* RequestPtr);
+
+_IRQL_requires_(DISPATCH_LEVEL)
+VOID
+SdhcLocalRequestDpc(
+    _In_ PKDPC Dpc,
+    _In_ PVOID DeferredContext,
+    _In_ PVOID SystemArgument1,
+    _In_ PVOID SystemArgument2
+);
 
 //
 // General utility routines
