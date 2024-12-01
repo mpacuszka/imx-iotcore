@@ -1,4 +1,5 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
+// Copyright 2022 NXP
 // Licensed under the MIT License.
 //
 // Module Name:
@@ -129,18 +130,9 @@ DriverEntry(
     initData.CrashdumpSupported = TRUE;
 
     //
-    // Initialize the device properties bookkeeping data structures
+    // Initialize the device properties data structures
     //
-    // N.B. Decision made to remove Device Properties List structure from current
-    //  release. Device Properties List was using _DSD to obtain information from
-    //  the platform in a manner that violates the _DSD specification.
-    //  However, the Device Properties List structure is necessary for future
-    //  enhancements to this driver so we are leaving it in the code.
-    //  Search for "DevicePropertiesList Code"
-    //
-#if 0   // DevicePropertiesList Code
     SdhcDevicePropertiesListInit();
-#endif
 
     //
     // Hook up the IRP dispatch routines
@@ -251,7 +243,7 @@ SdhcSlotInterrupt(
     // If we have an external SDIO interrupt, notify the port driver.
     //
     if (intStatus.CINT) {
-        *SdioInterruptPtr = TRUE; 
+        *SdioInterruptPtr = TRUE;
     }
 
     //
@@ -279,6 +271,11 @@ SdhcSlotInterrupt(
         intStatusEnableMask.BRR = intStatus.BRR;
         intStatusEnableMask.BWR = intStatus.BWR;
         SdhcDisableInterrupt(sdhcExtPtr, intStatusEnableMask.AsUint32);
+
+        if (sdhcExtPtr->TuningInProgress) {
+            sdhcExtPtr->WaitTuningCmd = FALSE;
+            sdhcExtPtr->TuningStatus = (intStatus.AsUint32 & USDHC_INT_STATUS_ERROR) ? STATUS_IO_DEVICE_ERROR : STATUS_SUCCESS;
+        }
     }
 
     //
@@ -302,6 +299,27 @@ SdhcSlotInterrupt(
         (*SdioInterruptPtr) ||
         (*TuningPtr);
 
+    if (handled && !sdhcExtPtr->CrashdumpMode) {
+        if (InterlockedCompareExchange(&sdhcExtPtr->LocalRequestPending, 0, 0)) {
+            //
+            // We may not get a DPC from sdport when issuing local requests.
+            // Queue a custom DPC instead.
+            //
+            InterlockedOr((PLONG)&sdhcExtPtr->CurrentEvents, *EventsPtr);
+            InterlockedOr((PLONG)&sdhcExtPtr->CurrentErrors, *ErrorsPtr);
+
+            KeInsertQueueDpc(&sdhcExtPtr->LocalRequestDpc, NULL, NULL);
+
+            //
+            // Actually ensure we don't get a DpcForIsr at the same time.
+            // Let sdport sense card changes but not anything else.
+            //
+            handled = (*CardChangePtr == TRUE);
+            *EventsPtr = 0;
+            *ErrorsPtr = 0;
+        }
+    }
+
     USDHC_DDI_EXIT(sdhcExtPtr->IfrLogHandle, sdhcExtPtr, "%!bool!", handled);
     return handled;
 }
@@ -320,14 +338,21 @@ SdhcSlotIssueRequest(
         sdhcExtPtr,
         "()");
 
+
+    if (InterlockedExchangePointer((PVOID volatile*)&sdhcExtPtr->OutstandingRequest, RequestPtr) != NULL) {
+        USDHC_LOG_INFORMATION(
+            sdhcExtPtr->IfrLogHandle,
+            sdhcExtPtr,
+            (__FUNCTION__ " Previous request is in progress"));
+    }
     if (RequestPtr->Type == SdRequestTypeCommandNoTransfer) {
-        
+
         //
         // Disable ASSERT for now until matching WDK fix is used
         //
         //NT_ASSERT(RequestPtr->Command.BlockCount == 0);
         //NT_ASSERT(RequestPtr->Command.Length == 0);
-        
+
         RequestPtr->Command.BlockCount = 0;
         RequestPtr->Command.Length = 0;
 
@@ -382,7 +407,14 @@ SdhcSlotIssueRequest(
                 sdhcExtPtr,
                 status,
                 "SdhcStartTransfer() failed");
+        } else {
+            //
+            // On successful transfer initiation reset the status to
+            // STATUS_PENDING as expected by SDPORT.
+            //
+            status = STATUS_PENDING;
         }
+
         break;
 
     default:
@@ -476,6 +508,36 @@ SdhcSlotRequestDpc(
         Errors);
 
     //
+    // WORKAROUND:
+    // This can occur when we're delaying request completion in a thread.
+    //
+    if (((Events == 0) && (Errors == 0)) || (RequestPtr->RequiredEvents == 0)) {
+        return;
+    }
+
+    //
+    // Save current events, since we may not be waiting for them
+    // at this stage, but we may be on the next phase of the command
+    // processing.
+    // For instance with short data read requests, the transfer is probably
+    // completed by the time the command is done.
+    // If that case if we wait for that events after it has already arrived,
+    // we will fail with timeout.
+    //
+    InterlockedOr((PLONG)&sdhcExtPtr->CurrentEvents, Events);
+    InterlockedOr((PLONG)&sdhcExtPtr->CurrentErrors, Errors);
+
+    //
+    // Check for out of sequence call?
+    // SDPORT does not maintain a request state, so we may get a request that
+    // has not been issued yet!
+    //
+    if (InterlockedExchangePointer((PVOID volatile*)&sdhcExtPtr->OutstandingRequest,
+                                   sdhcExtPtr->OutstandingRequest) == NULL) {
+        return;
+    }
+
+    //
     // Clear the request's required events if they have completed.
     //
     RequestPtr->RequiredEvents &= ~Events;
@@ -483,50 +545,33 @@ SdhcSlotRequestDpc(
     //
     // If there are errors, we need to fail whatever outstanding request
     // was on the bus. Otherwise, the request succeeded.
-    // 
+    //
+    Errors = InterlockedCompareExchange((PLONG)&sdhcExtPtr->CurrentErrors, 0, 0);
     if (Errors) {
-        RequestPtr->RequiredEvents = 0;
-        NTSTATUS status = SdhcConvertStandardErrorToStatus(Errors);
-        SdhcCompleteRequest(sdhcExtPtr, RequestPtr, status);
+        //
+        // Wait for CMD/DTO interrupt after timeout before completing the request.
+        //
+        if (((Errors & SDPORT_ERROR_CMD_TIMEOUT) && !(Events & SDPORT_EVENT_CARD_RESPONSE)) ||
+            ((Errors & SDPORT_ERROR_DATA_TIMEOUT) && !(Events & SDPORT_EVENT_CARD_RW_END))) {
+            goto Exit;
+        }
 
+        RequestPtr->RequiredEvents = 0;
+        InterlockedAnd((PLONG)&sdhcExtPtr->CurrentEvents, 0);
+
+        RequestPtr->Status = SdhcConvertStandardErrorToStatus(Errors);
+        InterlockedAnd((PLONG)&sdhcExtPtr->CurrentErrors, 0);
+
+        SdhcCompleteRequest(sdhcExtPtr, RequestPtr, RequestPtr->Status);
     } else if (RequestPtr->RequiredEvents == 0) {
         if (RequestPtr->Status != STATUS_MORE_PROCESSING_REQUIRED) {
-
             RequestPtr->Status = STATUS_SUCCESS;
-
-            //
-            // WORKAROUND: uSDHC does not fire TC interrupt as specified in the datasheet
-            // for commands with Busy signal i.e R1b and R5b. To get around this and make sure
-            // Busy signal is deasserted we poll on PRES_STATE.DLA which will be 0 once
-            // the DATA line becomes inactive
-            //
-            if ((RequestPtr->Command.ResponseType == SdResponseTypeR1B) ||
-                (RequestPtr->Command.ResponseType == SdResponseTypeR5B)) {
-
-                volatile USDHC_REGISTERS* registersPtr = sdhcExtPtr->RegistersPtr;
-                USDHC_PRES_STATE_REG presState = { SdhcReadRegister(&registersPtr->PRES_STATE) };
-                UINT32 retries = USDHC_POLL_RETRY_COUNT;
-
-                while (presState.DLA && retries) {
-                    SdPortWait(USDHC_POLL_WAIT_TIME_US);
-                    presState.AsUint32 = SdhcReadRegister(&registersPtr->PRES_STATE);
-                    --retries;
-                }
-
-                if (presState.DLA) {
-                    NT_ASSERT(!retries);
-                    USDHC_LOG_ERROR(
-                        sdhcExtPtr->IfrLogHandle,
-                        sdhcExtPtr,
-                        "Time-out waiting on DAT0 to get released");
-                    RequestPtr->Status = STATUS_IO_TIMEOUT;
-                }
-            }
         }
 
         SdhcCompleteRequest(sdhcExtPtr, RequestPtr, RequestPtr->Status);
     }
 
+Exit:
     USDHC_DDI_EXIT(sdhcExtPtr->IfrLogHandle, sdhcExtPtr, "()");
 }
 
@@ -597,7 +642,7 @@ SdhcSlotClearEvents(
         sdhcExtPtr,
         "EventMask:0x%08X",
         EventMask);
-    
+
     UINT32 Interrupts =
         SdhcConvertStandardEventsToIntStatusMask(
             EventMask,
@@ -618,10 +663,9 @@ SdhcCleanup(
         NullPrivateExtensionPtr,
         "()");
 
-#if 0   //DevicePropertiesList Code
+    USDHC_EXTENSION* sdhcExtPtr;
     USDHC_DEVICE_PROPERTIES* devPropsPtr =
         DevicePropertiesListSafeFindByPdo(SdhcMiniportGetPdo(MiniportPtr));
-    NT_ASSERTMSG("Device properties entry should always exist", devPropsPtr != nullptr);
     if (devPropsPtr != nullptr) {
         //
         // The current design assumes and supports only 1 Slot. Which implies that for each
@@ -630,7 +674,14 @@ SdhcCleanup(
         NT_ASSERT(MiniportPtr->SlotCount == 1);
         (VOID)DevicePropertiesListSafeRemoveByKey(devPropsPtr->Key);
     }
-#endif
+
+    for (LONG i = 0; i < MiniportPtr->SlotCount; i++) {
+        sdhcExtPtr = reinterpret_cast<USDHC_EXTENSION*>(
+            MiniportPtr->SlotExtensionList[i]->PrivateExtension);
+        if (sdhcExtPtr->CompleteRequestBusyWorkItem) {
+            IoFreeWorkItem(sdhcExtPtr->CompleteRequestBusyWorkItem);
+        }
+    }
 
     SdhcLogCleanup(MiniportPtr);
     WPP_CLEANUP(NULL);
@@ -761,7 +812,7 @@ SdhcSendCommand(
     case SdResponseTypeR4:
         cmdXfrTyp.RSPTYP = USDHC_CMD_XFR_TYP_RSPTYP_RSP_48;
         break;
-    
+
     default:
         NT_ASSERTMSG("Invalid response type", FALSE);
         return STATUS_INVALID_PARAMETER;
@@ -800,6 +851,8 @@ SdhcSendCommand(
     // type or whether the command involves data transfer, we will need
     // to wait on a number of different events
     //
+    InterlockedAnd((PLONG)&SdhcExtPtr->CurrentEvents, 0);
+    InterlockedAnd((PLONG)&SdhcExtPtr->CurrentErrors, 0);
     USDHC_INT_STATUS_REG requiredEvents = { 0 };
     requiredEvents.CC = 1;
 
@@ -1002,12 +1055,16 @@ SdhcStartPioTransfer(
     SDPORT_REQUEST* RequestPtr
     )
 {
+    ULONG CurrentEvents;
+    NTSTATUS status = STATUS_PENDING;
+
     volatile USDHC_REGISTERS* registersPtr = SdhcExtPtr->RegistersPtr;
     SDPORT_COMMAND* cmdPtr = &RequestPtr->Command;
 
     NT_ASSERT((cmdPtr->TransferDirection == SdTransferDirectionRead) ||
               (cmdPtr->TransferDirection == SdTransferDirectionWrite));
 
+    CurrentEvents = InterlockedExchange((PLONG)&SdhcExtPtr->CurrentEvents, 0);
     //
     // PIO transfers are paced by FIFO interrupts, where each interrupt indicates that
     // there is at least 1 RD_WML words to read or enough space for WR_WML words to write.
@@ -1050,8 +1107,13 @@ SdhcStartPioTransfer(
         }
         RequestPtr->Status = STATUS_MORE_PROCESSING_REQUIRED;
     } else {
-        requiredEventsMask.TC = 1;
         RequestPtr->Status = STATUS_SUCCESS;
+        if ((CurrentEvents & SDPORT_EVENT_CARD_RW_END) != 0) {
+            SdhcCompleteRequest(SdhcExtPtr, RequestPtr, RequestPtr->Status);
+            status = STATUS_SUCCESS;
+        } else {
+            requiredEventsMask.TC = 1;
+        }
     }
 
     SdhcConvertIntStatusToStandardEvents(
@@ -1074,7 +1136,7 @@ SdhcStartPioTransfer(
         SdhcEnableInterrupt(SdhcExtPtr, intStatusEnableMask.AsUint32);
     }
 
-    return STATUS_PENDING;
+    return status;
 }
 
 _Use_decl_annotations_
@@ -1142,7 +1204,7 @@ SdhcCreateAdmaDescriptorTable(
             //
             NT_ASSERT((ULONG_PTR(nextAddress.LowPart) & 0x3) == 0);
             descriptorPtr->Address = static_cast<UINT32>(nextAddress.LowPart);
-    
+
             nextAddress.QuadPart += nextLength;
             ++descriptorPtr;
             ++tableEntryCount;
@@ -1298,6 +1360,43 @@ SdhcConvertStandardErrorToStatus(
 }
 
 _Use_decl_annotations_
+NTSTATUS
+SdhcWaitDataIdle(
+    _In_ USDHC_EXTENSION* SdhcExtPtr
+)
+{
+    volatile USDHC_REGISTERS* registersPtr = SdhcExtPtr->RegistersPtr;
+    USDHC_PRES_STATE_REG presState;
+    UINT32 retries = USDHC_POLL_RETRY_COUNT;
+    for (retries = USDHC_POLL_RETRY_COUNT; retries > 0; retries--) {
+        presState = { SdhcReadRegister(&registersPtr->PRES_STATE) };
+        if (!presState.DLA) {
+            return STATUS_SUCCESS;
+        }
+        SdPortWait(USDHC_POLL_WAIT_TIME_US);
+    }
+
+    USDHC_LOG_ERROR_STATUS(SdhcExtPtr->IfrLogHandle, SdhcExtPtr, STATUS_IO_TIMEOUT, "Timeout");
+
+    return STATUS_IO_TIMEOUT;
+}
+
+_Use_decl_annotations_
+VOID
+SdhcCompleteRequestBusyWorker(
+    _In_opt_ PDEVICE_OBJECT DeviceObject,
+    _In_ PVOID Context
+)
+{
+    UNREFERENCED_PARAMETER(DeviceObject);
+
+    USDHC_EXTENSION* SdhcExtPtr = (USDHC_EXTENSION*)Context;
+    NTSTATUS Status = SdhcWaitDataIdle(SdhcExtPtr);
+
+    SdhcCompleteRequest(SdhcExtPtr, SdhcExtPtr->OutstandingRequest, Status);
+}
+
+_Use_decl_annotations_
 VOID
 SdhcCompleteRequest(
     USDHC_EXTENSION* SdhcExtPtr,
@@ -1317,7 +1416,57 @@ SdhcCompleteRequest(
         RequestPtr->Command.Length,
         Status);
 
+    const SDPORT_REQUEST* CurRequest;
+    const SDPORT_COMMAND* Command = &RequestPtr->Command;
+    BOOLEAN IsCommandCompleted = TRUE;
+
     RequestPtr->Status = Status;
+
+    //
+    // Data commands are done after all data has been
+    // transfered.
+    //
+    //
+    // WORKAROUND: uSDHC does not fire TC interrupt as specified in the datasheet
+    // for commands with Busy signal i.e R1b and R5b. To get around this and make sure
+    // Busy signal is deasserted we poll on PRES_STATE.DLA which will be 0 once
+    // the DATA line becomes inactive
+    //
+    if ((Status == STATUS_SUCCESS) && (RequestPtr->RequiredEvents == 0) &&
+        ((RequestPtr->Command.ResponseType == SdResponseTypeR1B) ||
+         (RequestPtr->Command.ResponseType == SdResponseTypeR5B) ||
+         (RequestPtr->Command.TransferDirection == SdTransferDirectionWrite))) {
+        volatile USDHC_REGISTERS* registersPtr = SdhcExtPtr->RegistersPtr;
+        USDHC_PRES_STATE_REG presState = { SdhcReadRegister(&registersPtr->PRES_STATE) };
+        if (presState.DLA) {
+            if ((SdhcExtPtr->CompleteRequestBusyWorkItem != NULL) && (KeGetCurrentIrql() == DISPATCH_LEVEL)) {
+                IoQueueWorkItem(
+                    SdhcExtPtr->CompleteRequestBusyWorkItem,
+                    SdhcCompleteRequestBusyWorker,
+                    CriticalWorkQueue,
+                    SdhcExtPtr);
+            } else {
+                SdhcCompleteRequestBusyWorker(NULL, SdhcExtPtr);
+            }
+
+            return;
+        }
+    }
+
+    if ((Command->TransferType != SdTransferTypeNone) &&
+        (Command->TransferType != SdTransferTypeUndefined)) {
+        IsCommandCompleted = Command->BlockCount == 0;
+    }
+
+    if (IsCommandCompleted) {
+        CurRequest = (const SDPORT_REQUEST*)InterlockedExchangePointer(
+            (PVOID volatile*)&SdhcExtPtr->OutstandingRequest,
+            NULL
+        );
+        if (CurRequest != RequestPtr) {
+            NT_ASSERT(FALSE);
+        }
+    }
 
     switch (RequestPtr->Type) {
     case SdRequestTypeCommandNoTransfer:
@@ -1342,7 +1491,10 @@ SdhcCompleteRequest(
         NT_ASSERTMSG("Unsupported request type", FALSE);
     }
 
-    SdPortCompleteRequest(RequestPtr, Status);
+    LONG LocalRequestPending = InterlockedCompareExchange(&SdhcExtPtr->LocalRequestPending, 0, 1);
+    if (!LocalRequestPending) {
+        SdPortCompleteRequest(RequestPtr, RequestPtr->Status);
+    }
 }
 
 _Use_decl_annotations_
@@ -1391,28 +1543,21 @@ SdhcGetSlotCount(
     USDHC_DDI_ENTER(DriverLogHandle, NullPrivateExtensionPtr, "()");
     NTSTATUS status;
 
-#if 0   // DevicePropertiesList Code
     DEVICE_OBJECT* sdhcPdoPtr = SdhcMiniportGetPdo(MiniportPtr);
     USDHC_DEVICE_PROPERTIES* devPropsPtr;
+    UCHAR SlotCount;
 
-    //
     // Read Device Properties associated with the SDHC PDO
-    //
     status = SdhcReadDeviceProperties(sdhcPdoPtr, &devPropsPtr);
     if (!NT_SUCCESS(status)) {
-        USDHC_LOG_ERROR_STATUS(
-            DriverLogHandle,
-            NullPrivateExtensionPtr,
-            status,
-            "Failed to read Device Properties for SDHC PDO:0x%p",
-            sdhcPdoPtr);
-        goto Cleanup;
+        SlotCount = USDHC_DEFAULT_SLOT_COUNT;
+    } else {
+        SlotCount = (UCHAR)(devPropsPtr->SlotCount);
     }
-#endif
 
     switch (MiniportPtr->ConfigurationInfo.BusType) {
     case SdBusTypeAcpi:
-        *SlotCountPtr = USDHC_DEFAULT_SLOT_COUNT;
+        *SlotCountPtr = SlotCount;
         status = STATUS_SUCCESS;
         goto Cleanup;
         break;
@@ -1471,6 +1616,8 @@ SdhcSlotInitialize(
     USDHC_EXTENSION* sdhcExtPtr = static_cast<USDHC_EXTENSION*>(PrivateExtensionPtr);
     NTSTATUS status;
     USDHC_HOST_CTRL_CAP_REG hostCtrlCap;
+    PSD_MINIPORT Miniport = CONTAINING_RECORD(PrivateExtensionPtr, SDPORT_SLOT_EXTENSION, PrivateExtension)->Miniport;
+    PDEVICE_OBJECT MiniportFdo = (PDEVICE_OBJECT)Miniport->ConfigurationInfo.DeviceObject;
 
     //
     // Initialize the USDHC_EXTENSION register space.
@@ -1493,7 +1640,7 @@ SdhcSlotInitialize(
         // Give a chance to change break flags from debugger to control debugging experience
         // from within crashdump environment
         //
-        DbgBreakPoint();
+        //  DbgBreakPoint();
     }
 #endif // DBG
 
@@ -1504,46 +1651,57 @@ SdhcSlotInitialize(
     //
     if (!CrashdumpMode) {
         SdhcLogInit(sdhcExtPtr);
-#if 0   // DevicePropertiesList Code
-        //
-        // Grab device properties and keep a local copy of it
-        //
+        // Load device properties and keep a local copy of it
         USDHC_DEVICE_PROPERTIES* devPropsPtr =
-            DevicePropertiesListSafeFindByKey(
-                reinterpret_cast<UINT32>(sdhcExtPtr->PhysicalAddress));
+            DevicePropertiesListSafeFindByKey((UINT32)(UINT64)(sdhcExtPtr->PhysicalAddress));
         if (devPropsPtr == nullptr) {
-            NT_ASSERTMSG("Can't operate without device properties", FALSE);
             //
-            // We should have been preceded by GetSlotCount bus operation in which
-            // we should have read the device properties
+            // Currently, we don't support SDBus power control
             //
-            USDHC_LOG_ERROR(
-                sdhcExtPtr->IfrLogHandle,
-                sdhcExtPtr,
-                "Unable to locate Device Properties entry for uSDHC with "
-                "PhysicalAddress:0x%p",
-                sdhcExtPtr->PhysicalAddress);
-            status = STATUS_DEVICE_CONFIGURATION_ERROR;
-            goto Cleanup;
+            sdhcExtPtr->DeviceProperties.Regulator1V8Exist         = FALSE;
+            sdhcExtPtr->DeviceProperties.SlotPowerControlSupported = FALSE;
+            sdhcExtPtr->DeviceProperties.SlotCount                 = USDHC_DEFAULT_SLOT_COUNT;
+            sdhcExtPtr->DeviceProperties.BaseClockFrequencyHz      = USDHC_DEFAULT_BASE_CLOCK_FREQ_HZ;
+            sdhcExtPtr->DeviceProperties.TuningStartTap            = SDHC_TUNING_CTRL_START_TAP_DFLT;
+            sdhcExtPtr->DeviceProperties.TuningStep                = SDHC_TUNING_CTRL_TUNING_STEP_DFLT;
+        } else {
+            RtlCopyMemory(
+                &sdhcExtPtr->DeviceProperties,
+                devPropsPtr,
+                sizeof(*devPropsPtr));
+
+            // Ensure that the power control is always treated as not supported
+            sdhcExtPtr->DeviceProperties.SlotPowerControlSupported = FALSE;
         }
 
-        RtlCopyMemory(
-            &sdhcExtPtr->DeviceProperties,
-            devPropsPtr,
-            sizeof(*devPropsPtr));
-#endif
+        // Allocate a work item for commands with busy signaling.
+        sdhcExtPtr->CompleteRequestBusyWorkItem = IoAllocateWorkItem(MiniportFdo);
+        // Initialize the DPC that handles local request completions.
+        KeInitializeDpc(&sdhcExtPtr->LocalRequestDpc, SdhcLocalRequestDpc, sdhcExtPtr);
+    } else {
+        // FIXME: HW specific device properties are read from ACPI in SdhcGetSlotCount() method. This method is not called in crashdump mode after dump_DriverEntry() is called 
+        // so these values are hardcoded here. Please keep them synchronized with values in Dsdt-Sdhc.asl ACPI table. 
+        // No modification is needed for currently supported NXP boards.
+        sdhcExtPtr->DeviceProperties.Regulator1V8Exist = TRUE;
+        sdhcExtPtr->DeviceProperties.SlotPowerControlSupported = FALSE;
+        sdhcExtPtr->DeviceProperties.SlotCount = USDHC_DEFAULT_SLOT_COUNT;
+        sdhcExtPtr->DeviceProperties.BaseClockFrequencyHz = 400000000;
+        sdhcExtPtr->DeviceProperties.TuningStartTap = 20;
+        sdhcExtPtr->DeviceProperties.TuningStep = 2;
     }
 
-    //
-    // Currently, we don't support 1.8V switching, SDR50/SDR104/DDR, and
-    // SDBus power control
-    //
-    sdhcExtPtr->DeviceProperties.Regulator1V8Exist = FALSE;
-    sdhcExtPtr->DeviceProperties.SlotPowerControlSupported = FALSE;
-    sdhcExtPtr->DeviceProperties.SlotCount = USDHC_DEFAULT_SLOT_COUNT;
-    sdhcExtPtr->DeviceProperties.BaseClockFrequencyHz =
-        USDHC_DEFAULT_BASE_CLOCK_FREQ_HZ;
+    // Reset tuning circuit
+    SdhcWriteRegister(&sdhcExtPtr->RegistersPtr->AUTOCMD12_ERR_STATUS, 0);
+    // Reset Controller
+    SdhcResetHost(sdhcExtPtr, SdResetTypeAll);
+    // Enable STD tuning
+    UINT32 tun = SdhcReadRegister(&sdhcExtPtr->RegistersPtr->TUNING_CTRL);
+    tun &= ~(SDHC_TUNING_CTRL_START_TAP_MASK | SDHC_TUNING_CTRL_TUNING_STEP_MASK);
+    tun |= SDHC_TUNING_CTRL_STD_TUNING_EN_MASK |
+           SDHC_TUNING_CTRL_TUNING_STEP(sdhcExtPtr->DeviceProperties.TuningStep) |
+           SDHC_TUNING_CTRL_START_TAP(sdhcExtPtr->DeviceProperties.TuningStartTap);
 
+    SdhcWriteRegister(&sdhcExtPtr->RegistersPtr->TUNING_CTRL, tun);
     //
     // Power-off the SD bus initially. Sdport will ask for power-up later on
     //
@@ -1551,17 +1709,8 @@ SdhcSlotInitialize(
     //  work when slot power control is fully supported.
     //
     if (sdhcExtPtr->DeviceProperties.SlotPowerControlSupported != FALSE) {
-        BOOLEAN enable = FALSE;
-        status = SdhcSetSdBusPower(sdhcExtPtr, enable);
-        if (!NT_SUCCESS(status)) {
-            USDHC_LOG_ERROR_STATUS(
-                sdhcExtPtr->IfrLogHandle,
-                sdhcExtPtr,
-                status,
-                "SDBus power-control not working as expected");
-
-            goto Cleanup;
-        }
+        status = STATUS_NOT_SUPPORTED;
+        goto Cleanup;
     }
 
     //
@@ -1594,6 +1743,8 @@ SdhcSlotInitialize(
 
     capabilitiesPtr->Supported.BusWidth8Bit = 1;
 
+// SlotPowerControlSupported is not supported but we will keep the code here.
+#if 0
     //
     // 1.8V switching is supported if the supporting regulator circuit exist
     // and SDBus power-control functionality is supported and reliable
@@ -1603,18 +1754,20 @@ SdhcSlotInitialize(
         (sdhcExtPtr->DeviceProperties.SlotPowerControlSupported != FALSE)) {
         capabilitiesPtr->Supported.SignalingVoltage18V = 1;
     }
+#endif
 
     //
-    // uSDHC supports 1.8V signaling, SDR50, SDR105 and DDR50 modes
+    // uSDHC supports 1.8V signaling, SDR50, SDR104 and DDR50 modes
     // However, we claim not supporting SD104 due to missing tuning implementation,
     // and not supporting DDR50 due to Sdport not having that working properly
     // at the moment
     //
+    capabilitiesPtr->Supported.SignalingVoltage18V = sdhcExtPtr->DeviceProperties.Regulator1V8Exist;
     capabilitiesPtr->Supported.SDR50 = capabilitiesPtr->Supported.SignalingVoltage18V;
     capabilitiesPtr->Supported.SDR104 = 0;
     capabilitiesPtr->Supported.DDR50 = 0;
 
-    capabilitiesPtr->Supported.HS200 = 0;
+    capabilitiesPtr->Supported.HS200 = capabilitiesPtr->Supported.SignalingVoltage18V;
     capabilitiesPtr->Supported.HS400 = 0;
 
     capabilitiesPtr->Supported.TuningForSDR50 = 0;
@@ -1650,6 +1803,13 @@ SdhcSlotInitialize(
         capabilitiesPtr->DmaDescriptorSize = 0;
         capabilitiesPtr->Supported.ScatterGatherDma = 0;
     }
+
+    //
+    // The single active request.
+    //
+
+    sdhcExtPtr->OutstandingRequest = NULL;
+
 
     status = STATUS_SUCCESS;
 
@@ -2116,6 +2276,7 @@ SdhcSetSpeed(
         break;
 
     case SdBusSpeedHS200:
+        break;
     case SdBusSpeedHS400:
         USDHC_LOG_ERROR(
             SdhcExtPtr->IfrLogHandle,
@@ -2322,10 +2483,7 @@ SdhcSetBusVoltage(
     // is already operating in 1.8V
     //
     if (SdhcExtPtr->DeviceProperties.SlotPowerControlSupported != FALSE) {
-        NTSTATUS status = SdhcSetSdBusPower(SdhcExtPtr, powerOn);
-        if (!NT_SUCCESS(status)) {
-            return status;
-        }
+        return STATUS_NOT_SUPPORTED;
     }
 
     return STATUS_SUCCESS;
@@ -2373,6 +2531,7 @@ SdhcSetSdBusPower(
     return STATUS_SUCCESS;
 }
 
+#if 0
 _Use_decl_annotations_
 BOOLEAN
 SdhcIsSlotPowerControlSupported(
@@ -2402,14 +2561,130 @@ SdhcIsSlotPowerControlSupported(
 
     return FALSE;
 }
+#endif
 
 _Use_decl_annotations_
-NTSTATUS
-SdhcExecuteTuning(
-    USDHC_EXTENSION* /* SdhcExtPtr */
-    )
+VOID
+SdhcLocalRequestDpc(
+    _In_ PKDPC Dpc,
+    _In_ PVOID DeferredContext,
+    _In_ PVOID SystemArgument1,
+    _In_ PVOID SystemArgument2
+)
 {
-    return STATUS_NOT_SUPPORTED;
+    UNREFERENCED_PARAMETER(Dpc);
+    UNREFERENCED_PARAMETER(SystemArgument1);
+    UNREFERENCED_PARAMETER(SystemArgument2);
+
+    PSDPORT_REQUEST Request;
+    ULONG Events;
+    ULONG Errors;
+
+    USDHC_EXTENSION* SdhcExtension = (USDHC_EXTENSION*)DeferredContext;
+
+    Request = (PSDPORT_REQUEST)InterlockedCompareExchangePointer(
+        (PVOID volatile*)&SdhcExtension->OutstandingRequest, NULL, NULL);
+
+    Events = InterlockedCompareExchange((PLONG)&SdhcExtension->CurrentEvents, 0, 0);
+    Errors = InterlockedCompareExchange((PLONG)&SdhcExtension->CurrentErrors, 0, 0);
+
+    if (Request != NULL) {
+        SdhcSlotRequestDpc(DeferredContext, Request, Events, Errors);
+    }
+}
+
+_Use_decl_annotations_
+NTSTATUS SdhcSendTuneCmd(USDHC_EXTENSION* SdhcExtPtr)
+{
+    SDPORT_REQUEST Request;
+    SDPORT_REQUEST *RequestPtr = &Request;
+    volatile USDHC_REGISTERS* registersPtr = SdhcExtPtr->RegistersPtr;
+    unsigned retries = USDHC_TUNING_CMD_TIMEOUT_MS;
+    UCHAR DataBuffer[128] = { 0 };
+    USDHC_PROT_CTRL_REG protCtrl = { SdhcReadRegister(&registersPtr->PROT_CTRL) };
+
+    RtlZeroMemory(&Request, sizeof(Request));
+    Request.Command.Class = SdCommandClassStandard;
+    Request.Command.Argument = 0;
+    Request.Command.TransferType = SdTransferTypeSingleBlock;
+    Request.Command.TransferDirection = SdTransferDirectionRead;
+    Request.Command.TransferMethod = SdTransferMethodPio;
+    Request.Command.BlockCount = 1;
+    Request.Command.ResponseType = SdResponseTypeR1;
+    Request.Command.Length = (protCtrl.DTW == USDHC_PROT_CTRL_DTW_8BIT) ? 128 : 64;
+    Request.Command.BlockSize = (USHORT)Request.Command.Length;
+    Request.Command.Index = 21;
+    Request.Command.DataBuffer = &DataBuffer[0];
+
+    SdhcExtPtr->WaitTuningCmd = TRUE;
+    SdhcSendCommand(SdhcExtPtr, RequestPtr);
+    while (SdhcExtPtr->WaitTuningCmd) {
+        if (SdhcExtPtr->CrashdumpMode) {
+            ULONG   EventsPtr = 0;
+            ULONG   ErrorsPtr = 0;
+            BOOLEAN CardChangePtr = FALSE;
+            BOOLEAN SdioInterruptPtr = FALSE;
+            BOOLEAN TuningPtr = FALSE;
+            SdhcSlotInterrupt(SdhcExtPtr, &EventsPtr, &ErrorsPtr, &CardChangePtr, &SdioInterruptPtr, &TuningPtr);
+        }
+        SdPortWait(1000);
+        retries--;
+        if (retries == 0) {
+            return STATUS_IO_DEVICE_ERROR;
+        }
+    }
+    
+    return SdhcExtPtr->TuningStatus;
+}
+
+_Use_decl_annotations_
+NTSTATUS SdhcExecuteTuning(USDHC_EXTENSION* SdhcExtPtr)
+{
+    UINT16 i;
+    NTSTATUS status = STATUS_IO_DEVICE_ERROR;
+    volatile USDHC_REGISTERS* registersPtr = SdhcExtPtr->RegistersPtr;
+
+    USDHC_LOG_INFORMATION(SdhcExtPtr->IfrLogHandle, SdhcExtPtr, "Tuning entry");
+
+    SdhcExtPtr->TuningInProgress = TRUE;
+
+    // It is recommended to use internal clock as the tuning clock.
+    USDHC_MIX_CTRL_REG mixCtrl = { SdhcReadRegister(&registersPtr->MIX_CTRL) };
+    mixCtrl.FBCLK_SEL = 1;
+    SdhcWriteRegister(&registersPtr->MIX_CTRL, mixCtrl.AsUint32);
+    // Enable tuning execution
+    UINT32 acmd12 = { SdhcReadRegister(&registersPtr->AUTOCMD12_ERR_STATUS) };
+    acmd12 |= SDHC_AUTOCMD12_ERR_STATUS_EXECUTE_TUNING;
+    SdhcWriteRegister(&registersPtr->AUTOCMD12_ERR_STATUS, acmd12);
+
+    for (i = 0; i < USDHC_TUNING_RETRIES; i++) {
+        // Send tuning command
+        status = SdhcSendTuneCmd(SdhcExtPtr);
+        if (status) {
+            break;
+        }
+        // Check if tuning was successful or not.
+        acmd12 = { SdhcReadRegister(&registersPtr->AUTOCMD12_ERR_STATUS) };
+        if (!(acmd12 & SDHC_AUTOCMD12_ERR_STATUS_EXECUTE_TUNING)) {
+            if (acmd12 & SDHC_AUTOCMD12_ERR_STATUS_SMP_CLK_SEL) {
+                USDHC_LOG_INFORMATION(SdhcExtPtr->IfrLogHandle, SdhcExtPtr, "Tuning pass at %d iteration", i);
+                SdPortWait(1000); // Make sure sdmmc finish handling of tuning data
+                break;
+            }
+        }
+        SdPortWait(1000);
+    }
+
+    if (status || !(acmd12 & SDHC_AUTOCMD12_ERR_STATUS_SMP_CLK_SEL)) {
+        acmd12 &= ~(SDHC_AUTOCMD12_ERR_STATUS_SMP_CLK_SEL | SDHC_AUTOCMD12_ERR_STATUS_EXECUTE_TUNING);
+        SdhcWriteRegister(&registersPtr->AUTOCMD12_ERR_STATUS, acmd12);
+        status = STATUS_IO_DEVICE_ERROR;
+        USDHC_LOG_INFORMATION(SdhcExtPtr->IfrLogHandle, SdhcExtPtr, "Tuning fail");
+    }
+
+    SdhcExtPtr->TuningInProgress = FALSE;
+
+    return status;
 }
 
 _Use_decl_annotations_
@@ -2544,8 +2819,9 @@ SdhcReadDeviceProperties(
             DriverLogHandle,
             NullPrivateExtensionPtr,
             status,
-            "AcpiDevicePropertiesQueryIntegerValue(BaseClockFrequencyHz) failed");
-        goto Cleanup;
+            "AcpiDevicePropertiesQueryIntegerValue(BaseClockFrequencyHz) failed, using default value");
+        status = STATUS_SUCCESS;
+        devPropsPtr->BaseClockFrequencyHz = USDHC_DEFAULT_BASE_CLOCK_FREQ_HZ;
     }
 
     status =
@@ -2558,8 +2834,9 @@ SdhcReadDeviceProperties(
             DriverLogHandle,
             NullPrivateExtensionPtr,
             status,
-            "AcpiDevicePropertiesQueryIntegerValue(Regulator1V8Exist) failed");
-        goto Cleanup;
+            "AcpiDevicePropertiesQueryIntegerValue(Regulator1V8Exist) failed, using default value");
+        status = STATUS_SUCCESS;
+        devPropsPtr->Regulator1V8Exist = FALSE;
     }
 
     status =
@@ -2572,10 +2849,44 @@ SdhcReadDeviceProperties(
             DriverLogHandle,
             NullPrivateExtensionPtr,
             status,
-            "AcpiDevicePropertiesQueryIntegerValue(SlotCount) failed");
-        goto Cleanup;
+            "AcpiDevicePropertiesQueryIntegerValue(SlotCount) failed, using default value");
+        status = STATUS_SUCCESS;
+        devPropsPtr->SlotCount = USDHC_DEFAULT_SLOT_COUNT;
     }
 
+    status =
+        AcpiDevicePropertiesQueryIntegerValue(
+            devicePropertiesPkgPtr,
+            "TuningStartTap",
+            &devPropsPtr->TuningStartTap);
+    if (!NT_SUCCESS(status)) {
+        USDHC_LOG_ERROR_STATUS(
+            DriverLogHandle,
+            NullPrivateExtensionPtr,
+            status,
+            "AcpiDevicePropertiesQueryIntegerValue(TuningStartTap) failed, using default value");
+        status = STATUS_SUCCESS;
+        devPropsPtr->TuningStartTap = SDHC_TUNING_CTRL_START_TAP_DFLT;
+    }
+
+    status =
+        AcpiDevicePropertiesQueryIntegerValue(
+            devicePropertiesPkgPtr,
+            "TuningStep",
+            &devPropsPtr->TuningStep);
+    if (!NT_SUCCESS(status)) {
+        USDHC_LOG_ERROR_STATUS(
+            DriverLogHandle,
+            NullPrivateExtensionPtr,
+            status,
+            "AcpiDevicePropertiesQueryIntegerValue(TuningStep) failed, using default value");
+        status = STATUS_SUCCESS;
+        devPropsPtr->TuningStep = SDHC_TUNING_CTRL_TUNING_STEP_DFLT;
+    }
+
+// SlotPowerControlSupported is not supported but might be usefull in
+// future so we will keep the code here.
+#if 0
     //
     // Supporting slot power control is board design specific, and
     // not all uSDHCs will support slot power control via firmware
@@ -2588,6 +2899,7 @@ SdhcReadDeviceProperties(
             NullPrivateExtensionPtr,
             "Slot power control not supported, 1.8V switching may not work as expected");
     }
+#endif
 
     if (ARGUMENT_PRESENT(DevPropsPptr)) {
         *DevPropsPptr = devPropsPtr;
@@ -2654,7 +2966,7 @@ SdhcLogCleanup(
     //
     // Iterate over all uSDHC instances and delete their IFR logs
     //
-    for (LONG i = 0; i < MiniportPtr->SlotCount; ++i) {
+    for (LONG i = 0; i < MiniportPtr->SlotCount; i++) {
         sdhcExtPtr = reinterpret_cast<USDHC_EXTENSION*>(
             MiniportPtr->SlotExtensionList[i]->PrivateExtension);
         if (sdhcExtPtr->IfrLogHandle) {
